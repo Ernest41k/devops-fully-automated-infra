@@ -1,103 +1,141 @@
 def COLOR_MAP = [
-    'SUCCESS': 'good', 
+    'SUCCESS': 'good',
     'FAILURE': 'danger',
 ]
 
 pipeline {
     agent any
 
+    environment {
+        WORKSPACE = "${env.WORKSPACE}"
+    }
+
+    tools {
+        maven 'localMaven'
+        jdk 'localJdk'
+    }
+
     stages {
         stage('Git checkout') {
             steps {
-                echo 'Cloning project codebase...'
-                git branch: 'main', url: 'https://github.com/Ernest41k/devops-fully-automated-infra.git'
-                sh 'ls'
+                echo 'Cloning the application code...'
+                git branch: 'main', url: 'https://github.com/cvamsikrishna11/devops-fully-automated.git'
+
             }
         }
-        
-         stage('Verify Terraform Version') {
+
+        stage('Build') {
             steps {
-                echo 'verifying the terrform version...'
-                sh 'terraform --version'
+                sh 'java -version'
+                sh 'mvn -U clean package'
+            }
+
+            post {
+                success {
+                    echo 'archiving....'
+                    archiveArtifacts artifacts: '**/*.war', followSymlinks: false
+                }
+            }
+        }
+
+        stage('Unit Test') {
+            steps {
+                sh 'mvn test'
+            }
+        }
+        stage('Integration Test') {
+            steps {
+                sh 'mvn verify -DskipUnitTests'
+            }
+        }
+        stage('Checkstyle Code Analysis') {
+            steps {
+                sh 'mvn checkstyle:checkstyle'
+            }
+            post {
+                success {
+                    echo 'Generated Analysis Result'
+                }
+            }
+        }
+
+        stage('SonarQube scanning') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    withCredentials([string(credentialsId: 'sonarqube-token', variable: 'SONAR_TOKEN')]) {
+                        sh """
+                    mvn sonar:sonar \
+                    -Dsonar.projectKey=maven \
+                    -Dsonar.host.url=http://52.91.26.64:9000 \
+                    -Dsonar.login=$SONAR_TOKEN
+                    """
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                waitForQualityGate abortPipeline: true
+            }
+        }
+
+        stage('Upload artifact to Nexus') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'nexus-credentials', passwordVariable: 'PASSWORD', usernameVariable: 'USER_NAME')]) {
+                sh "sed -i \"s/.*<username><\\/username>/<username>$USER_NAME<\\/username>/g\" ${WORKSPACE}/nexus-setup/settings.xml"
+                sh "sed -i \"s/.*<password><\\/password>/<password>$PASSWORD<\\/password>/g\" ${WORKSPACE}/nexus-setup/settings.xml"
+                sh 'cp ${WORKSPACE}/nexus-setup/settings.xml /var/lib/jenkins/.m2'
+                sh 'mvn clean deploy -DskipTests'
+                }
                
             }
         }
-        
-        stage('Terraform init') {
+
+        stage('Deploy to DEV env') {
+            environment {
+                HOSTS = 'dev'
+            }
             steps {
-                echo 'Initiliazing terraform project...'
-                sh 'sudo terraform init'
-               
+                withCredentials([usernamePassword(credentialsId: 'ansible-deploy-server-credentials', passwordVariable: 'PASSWORD', usernameVariable: 'USER_NAME')]) {
+                    sh "ansible-playbook -i ${WORKSPACE}/ansible-setup/aws_ec2.yaml ${WORKSPACE}/deploy.yaml --extra-vars \"ansible_user=$USER_NAME ansible_password=$PASSWORD hosts=tag_Environment_$HOSTS workspace_path=$WORKSPACE\""
+                }
             }
         }
-        
-        
-        stage('Terraform validate') {
+
+        stage('Deploy to STAGE env') {
+            environment {
+                HOSTS = 'stage'
+            }
             steps {
-                echo 'Code syntax checking...'
-                sh 'sudo terraform validate'
-               
+                withCredentials([usernamePassword(credentialsId: 'ansible-deploy-server-credentials', passwordVariable: 'PASSWORD', usernameVariable: 'USER_NAME')]) {
+                    sh "ansible-playbook -i ${WORKSPACE}/ansible-setup/aws_ec2.yaml ${WORKSPACE}/deploy.yaml --extra-vars \"ansible_user=$USER_NAME ansible_password=$PASSWORD hosts=tag_Environment_$HOSTS workspace_path=$WORKSPACE\""
+                }
             }
         }
-        
-        
-        stage('Terraform plan') {
+
+        stage('Approval') {
             steps {
-                echo 'Terraform plan for the dry run...'
-                sh 'sudo terraform plan'
-               
-            }
-        } 
-                
-        
-        stage('Checkov scan') {
-            steps {
-                
-                sh """                
-                sudo pip3 install --upgrade pip
-                sudo pip3 install checkov
-                #checkov -d .
-                #checkov -d . --skip-check CKV_AWS_23,CKV_AWS_24,CKV_AWS_126,CKV_AWS_135,CKV_AWS_8,CKV_AWS_23,CKV_AWS_24
-                checkov -d . --skip-check CKV_AWS*
-                """
-               
-            }
-        }               
-        
-        stage('Manual approval') {
-            steps {
-                
-                input 'Approval required for deployment'
-               
+                input('Do you want to proceed?')
             }
         }
-        
-        
-         stage('Terraform apply') {
+
+        stage('Deploy to PROD env') {
+            environment {
+                HOSTS = 'prod'
+            }
             steps {
-                echo 'Terraform apply...'                           
-                sh 'sudo terraform apply --auto-approve'
-               
+                withCredentials([usernamePassword(credentialsId: 'ansible-deploy-server-credentials', passwordVariable: 'PASSWORD', usernameVariable: 'USER_NAME')]) {
+                    sh "ansible-playbook -i ${WORKSPACE}/ansible-setup/aws_ec2.yaml ${WORKSPACE}/deploy.yaml --extra-vars \"ansible_user=$USER_NAME ansible_password=$PASSWORD hosts=tag_Environment_$HOSTS workspace_path=$WORKSPACE\""
+                }
             }
         }
-        
-        // stage('Terraform destroy') {
-        //     steps {
-        //         echo 'Terraform destroy...'                             
-        //         sh 'sudo terraform destroy --auto-approve'
-               
-        //     }
-        // }
-        
     }
-    
-     post { 
-        always { 
+
+    post {
+        always {
             echo 'I will always say Hello again!'
             slackSend channel: '#team-devops', color: COLOR_MAP[currentBuild.currentResult], message: "*${currentBuild.currentResult}:* Job ${env.JOB_NAME} build ${env.BUILD_NUMBER} \n More info at: ${env.BUILD_URL}"
         }
     }
-    
-    
-    
 }
